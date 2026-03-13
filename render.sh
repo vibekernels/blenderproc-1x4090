@@ -17,10 +17,6 @@ if [ ! -f "$VENV_DIR/bin/blenderproc" ]; then
     pip install -r "$SCRIPT_DIR/requirements.txt"
 fi
 
-# Persist the OptiX kernel cache across runs (blenderproc cleans its tmp dir each time)
-export CYCLES_KERNEL_CACHE_PATH="$SCRIPT_DIR/.cycles_cache"
-mkdir -p "$CYCLES_KERNEL_CACHE_PATH"
-
 # Run the render
 echo "Starting render..."
 blenderproc run "$SCRIPT_DIR/render_beer_pong.py"

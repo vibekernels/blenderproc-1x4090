@@ -134,13 +134,6 @@ def create_cup(template, location):
 # ---------------------------------------------------------------------------
 bproc.init()
 
-# Force GPU-only rendering
-_cycles_prefs = bpy.context.preferences.addons['cycles'].preferences
-_cycles_prefs.compute_device_type = 'OPTIX'
-_cycles_prefs.get_devices()
-for _device in _cycles_prefs.devices:
-    _device.use = _device.type == 'OPTIX'
-bpy.context.scene.cycles.device = 'GPU'
 
 # --- Load cup model --------------------------------------------------------
 cup_objs = load_usdz(CUP_MODEL_PATH)
@@ -331,11 +324,8 @@ bproc.renderer.set_light_bounces(
 )
 bproc.renderer.enable_depth_output(activate_antialiasing=False)
 
-import time as _time
-_t0 = _time.time()
 print("Rendering...")
 data = bproc.renderer.render()
-print(f"render+load took {_time.time()-_t0:.2f}s")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 bproc.writer.write_hdf5(OUTPUT_DIR, data)
