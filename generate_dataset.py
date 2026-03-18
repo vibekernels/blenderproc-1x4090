@@ -756,13 +756,11 @@ def main():
     hdri_dir = os.path.join(args.assets_dir, "hdris")
     cctextures_dir = os.path.join(args.assets_dir, "cctextures")
 
-    rng = np.random.default_rng(args.seed)
-    # If resuming, advance the RNG to the right state
-    if args.start_scene > 0:
-        for _ in range(args.start_scene):
-            # Burn through the same random calls each scene would make
-            # (approximate - just advance state significantly)
-            rng.random(1000)
+    # Each scene gets its own deterministic RNG seeded from (base_seed, scene_index).
+    # This ensures identical results regardless of parallelization strategy —
+    # scene 42 produces the same output whether run in a single process or
+    # split across N workers.
+    base_seed = args.seed
 
     output_dir = args.output_dir
     images_dir = os.path.join(output_dir, 'images')
@@ -906,6 +904,9 @@ def main():
 
     for scene_i in range(args.start_scene, args.start_scene + args.num_scenes):
         scene_start = time.time()
+
+        # Per-scene deterministic RNG: same scene_i always produces same output
+        rng = np.random.default_rng([base_seed, scene_i])
 
         # --- [IMPROVEMENT 1] HDRI background ---
         # 75% HDRI, 25% flat color (for diversity)
