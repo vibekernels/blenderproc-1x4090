@@ -1,2 +1,4 @@
 output
 .venv
+yolov8n.pt
+__pycache__
