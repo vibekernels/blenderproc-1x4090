@@ -1,4 +1,4 @@
 output
 .venv
-yolov8n.pt
+yolo*.pt
 __pycache__
