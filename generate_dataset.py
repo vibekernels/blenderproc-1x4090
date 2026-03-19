@@ -364,7 +364,7 @@ def randomize_balls(rng, balls):
 
 
 # ---------------------------------------------------------------------------
-# [IMPROVEMENT 1] HDRI environment maps
+# [IMPROVEMENT 1] HDRI environment maps — with preloading
 # ---------------------------------------------------------------------------
 def discover_hdri_files(hdri_dir):
     """Find all .hdr files under the HDRI directory."""
@@ -374,211 +374,337 @@ def discover_hdri_files(hdri_dir):
     return files
 
 
-def set_hdri_background(path_to_hdr, strength=1.0, rotation_euler=None):
-    """Apply an HDRI to the world background, clearing any previous HDRI nodes."""
-    if rotation_euler is None:
-        rotation_euler = [0.0, 0.0, 0.0]
+class HDRIManager:
+    """
+    Pre-loads all HDRI images and creates persistent world shader nodes once.
+    Per-scene switching only changes the image pointer and uniform values —
+    no node creation/destruction, no image re-loading from disk.
+    """
 
-    world = bpy.context.scene.world
-    nodes = world.node_tree.nodes
-    links = world.node_tree.links
+    def __init__(self, hdri_files):
+        self.hdri_files = hdri_files
+        self.images = {}       # path -> bpy.data.images entry
+        self.tex_node = None
+        self.mapping_node = None
+        self.bg_node = None
+        self._nodes_created = False
 
-    # Remove old environment/mapping/texcoord nodes from previous HDRI calls
-    for node in list(nodes):
-        if node.type in ("TEX_ENVIRONMENT", "MAPPING", "TEX_COORD"):
-            nodes.remove(node)
+        # Pre-load all HDRI images into Blender's image cache
+        if hdri_files:
+            print(f"Pre-loading {len(hdri_files)} HDRI images...")
+            for path in hdri_files:
+                self.images[path] = bpy.data.images.load(path, check_existing=True)
+            print(f"HDRI images cached in memory")
+            self._setup_world_nodes()
 
-    # Find the existing Background node
-    bg_node = None
-    for node in nodes:
-        if node.type == "BACKGROUND":
-            bg_node = node
-            break
-    if bg_node is None:
-        bg_node = nodes.new("ShaderNodeBackground")
+    def _setup_world_nodes(self):
+        """Create the world shader node graph once."""
+        world = bpy.context.scene.world
+        nodes = world.node_tree.nodes
+        links = world.node_tree.links
 
-    # Create environment texture
-    tex_node = nodes.new("ShaderNodeTexEnvironment")
-    tex_node.image = bpy.data.images.load(path_to_hdr, check_existing=True)
+        # Clean any existing env nodes
+        for node in list(nodes):
+            if node.type in ("TEX_ENVIRONMENT", "MAPPING", "TEX_COORD"):
+                nodes.remove(node)
 
-    # Create mapping + texcoord for rotation control
-    mapping_node = nodes.new("ShaderNodeMapping")
-    texcoord_node = nodes.new("ShaderNodeTexCoord")
+        self.bg_node = None
+        for node in nodes:
+            if node.type == "BACKGROUND":
+                self.bg_node = node
+                break
+        if self.bg_node is None:
+            self.bg_node = nodes.new("ShaderNodeBackground")
 
-    links.new(texcoord_node.outputs["Generated"], mapping_node.inputs["Vector"])
-    links.new(mapping_node.outputs["Vector"], tex_node.inputs["Vector"])
-    links.new(tex_node.outputs["Color"], bg_node.inputs["Color"])
+        self.tex_node = nodes.new("ShaderNodeTexEnvironment")
+        self.mapping_node = nodes.new("ShaderNodeMapping")
+        texcoord_node = nodes.new("ShaderNodeTexCoord")
 
-    mapping_node.inputs["Rotation"].default_value = rotation_euler
-    bg_node.inputs["Strength"].default_value = strength
+        links.new(texcoord_node.outputs["Generated"], self.mapping_node.inputs["Vector"])
+        links.new(self.mapping_node.outputs["Vector"], self.tex_node.inputs["Vector"])
+        links.new(self.tex_node.outputs["Color"], self.bg_node.inputs["Color"])
 
+        self._nodes_created = True
 
-def clear_hdri_background():
-    """Remove HDRI nodes and revert to flat color background."""
-    world = bpy.context.scene.world
-    nodes = world.node_tree.nodes
-    links = world.node_tree.links
+    def set_hdri(self, rng):
+        """Switch to a random HDRI. Only updates image pointer + uniforms."""
+        if not self.hdri_files:
+            return None
 
-    for node in list(nodes):
-        if node.type in ("TEX_ENVIRONMENT", "MAPPING", "TEX_COORD"):
-            nodes.remove(node)
+        idx = rng.integers(len(self.hdri_files))
+        path = self.hdri_files[idx]
 
+        if not self._nodes_created:
+            self._setup_world_nodes()
 
-def random_hdri(rng, hdri_files):
-    """Pick a random HDRI and apply it with randomized rotation and strength."""
-    if not hdri_files:
-        return None
-    idx = rng.integers(len(hdri_files))
-    hdr_path = hdri_files[idx]
-    strength = rng.uniform(0.3, 1.5)
-    rotation = [0.0, 0.0, rng.uniform(0, 2 * np.pi)]
-    set_hdri_background(hdr_path, strength=strength, rotation_euler=rotation)
-    return os.path.basename(os.path.dirname(hdr_path))
+        # Just swap the image — no node creation, no disk I/O
+        self.tex_node.image = self.images[path]
+        self.mapping_node.inputs["Rotation"].default_value = [
+            0.0, 0.0, rng.uniform(0, 2 * np.pi)]
+        self.bg_node.inputs["Strength"].default_value = rng.uniform(0.3, 1.5)
+
+        return os.path.basename(os.path.dirname(path))
+
+    def disable_hdri(self):
+        """Disconnect HDRI so flat color background takes effect."""
+        if self._nodes_created:
+            world = bpy.context.scene.world
+            links = world.node_tree.links
+            # Remove the link from tex_node to bg_node so the flat color input wins
+            for link in list(links):
+                if link.to_node == self.bg_node and link.from_node == self.tex_node:
+                    links.remove(link)
+                    break
+            self._nodes_created = False
+
+    def enable_hdri(self):
+        """Reconnect HDRI nodes if previously disabled."""
+        if not self._nodes_created and self.tex_node and self.bg_node:
+            world = bpy.context.scene.world
+            links = world.node_tree.links
+            links.new(self.tex_node.outputs["Color"], self.bg_node.inputs["Color"])
+            self._nodes_created = True
 
 
 # ---------------------------------------------------------------------------
 # [IMPROVEMENT 2] CC texture materials for table and floor
+#
+# Performance-critical: we avoid replace_materials() entirely because swapping
+# materials on a mesh triggers Cycles shader recompilation (~150s overhead).
+# Instead we pre-scan texture image paths and hot-swap only the Image datablock
+# pointers inside a persistent material's texture nodes.
 # ---------------------------------------------------------------------------
-def load_cc_materials_if_available(cctextures_dir):
-    """Load CC textures if the asset directory exists. Returns list of Materials."""
+def discover_cc_texture_images(cctextures_dir):
+    """
+    Scan the CC texture directory and return a list of dicts, each containing
+    the image file paths for one texture asset (color, roughness, normal, etc.).
+    Does NOT use load_ccmaterials() — we manage images directly for speed.
+    """
     if not os.path.isdir(cctextures_dir):
         return []
-    try:
-        materials = bproc.loader.load_ccmaterials(
-            folder_path=cctextures_dir,
-            used_assets=None,  # use the default curated list
-            use_all_materials=True,
-        )
-        print(f"Loaded {len(materials)} CC texture materials")
-        return materials
-    except Exception as e:
-        print(f"Warning: Could not load CC textures: {e}")
-        return []
+
+    textures = []
+    for asset in sorted(os.listdir(cctextures_dir)):
+        asset_dir = os.path.join(cctextures_dir, asset)
+        if not os.path.isdir(asset_dir):
+            continue
+
+        # Look for color image (required)
+        color_path = os.path.join(asset_dir, f"{asset}_2K_Color.jpg")
+        if not os.path.exists(color_path):
+            color_path = os.path.join(asset_dir, f"{asset}_2K-JPG_Color.jpg")
+        if not os.path.exists(color_path):
+            continue
+
+        entry = {"name": asset, "color": color_path}
+
+        # Optional maps — same naming convention
+        for map_name in ["Roughness", "NormalGL", "Normal", "Displacement",
+                         "AmbientOcclusion", "Metalness"]:
+            p = color_path.replace("Color", map_name)
+            if os.path.exists(p):
+                entry[map_name.lower()] = p
+
+        textures.append(entry)
+
+    return textures
 
 
-def random_cc_texture_for_surface(rng, cc_materials, obj, fallback_mat, fallback_color):
+def preload_cc_images(texture_entries):
+    """Pre-load all CC texture images into Blender's image cache."""
+    image_cache = {}  # path -> bpy.data.images
+    for entry in texture_entries:
+        for key, path in entry.items():
+            if key == "name":
+                continue
+            if path not in image_cache:
+                img = bpy.data.images.load(path, check_existing=True)
+                # Mark non-color for non-diffuse maps
+                if key != "color":
+                    img.colorspace_settings.name = "Non-Color"
+                image_cache[path] = img
+    return image_cache
+
+
+def create_pbr_surface_material(name):
     """
-    With 70% probability, apply a random CC texture to the object.
-    Otherwise fall back to the flat-color material.
+    Create a persistent PBR material with texture nodes for color, roughness,
+    normal, and displacement. Returns (Material, node_refs_dict).
+    The same material stays assigned to the mesh forever — we only swap images.
+    """
+    mat = bproc.material.create(name)
+    bpy_mat = mat.blender_obj
+    nodes = bpy_mat.node_tree.nodes
+    links = bpy_mat.node_tree.links
+
+    principled = None
+    output_node = None
+    for n in nodes:
+        if n.type == "BSDF_PRINCIPLED":
+            principled = n
+        elif n.type == "OUTPUT_MATERIAL":
+            output_node = n
+
+    # Texture coordinate + mapping (shared)
+    texcoord = nodes.new("ShaderNodeTexCoord")
+    mapping = nodes.new("ShaderNodeMapping")
+    links.new(texcoord.outputs["UV"], mapping.inputs["Vector"])
+
+    # Color texture
+    color_tex = nodes.new("ShaderNodeTexImage")
+    color_tex.name = "cc_color"
+    links.new(mapping.outputs["Vector"], color_tex.inputs["Vector"])
+    links.new(color_tex.outputs["Color"], principled.inputs["Base Color"])
+
+    # Roughness texture
+    rough_tex = nodes.new("ShaderNodeTexImage")
+    rough_tex.name = "cc_roughness"
+    links.new(mapping.outputs["Vector"], rough_tex.inputs["Vector"])
+    links.new(rough_tex.outputs["Color"], principled.inputs["Roughness"])
+
+    # Normal map
+    normal_tex = nodes.new("ShaderNodeTexImage")
+    normal_tex.name = "cc_normal"
+    normal_map = nodes.new("ShaderNodeNormalMap")
+    links.new(mapping.outputs["Vector"], normal_tex.inputs["Vector"])
+    links.new(normal_tex.outputs["Color"], normal_map.inputs["Color"])
+    links.new(normal_map.outputs["Normal"], principled.inputs["Normal"])
+
+    node_refs = {
+        "principled": principled,
+        "color_tex": color_tex,
+        "rough_tex": rough_tex,
+        "normal_tex": normal_tex,
+        "mapping": mapping,
+    }
+    return mat, node_refs
+
+
+def apply_cc_texture_to_surface(rng, texture_entries, image_cache, node_refs,
+                                 fallback_color):
+    """
+    Hot-swap texture images in a persistent material. Only changes Image pointers
+    and a few uniform values — no material replacement, no shader recompilation.
     Returns description string for metadata.
     """
-    if cc_materials and rng.random() < 0.7:
-        idx = rng.integers(len(cc_materials))
-        mat = cc_materials[idx]
-        obj.replace_materials(mat)
-        return f"cc:{mat.get_name()}"
+    if texture_entries and rng.random() < 0.7:
+        idx = rng.integers(len(texture_entries))
+        entry = texture_entries[idx]
+
+        node_refs["color_tex"].image = image_cache[entry["color"]]
+
+        if "roughness" in entry:
+            node_refs["rough_tex"].image = image_cache[entry["roughness"]]
+            node_refs["rough_tex"].mute = False
+        else:
+            node_refs["rough_tex"].mute = True
+
+        normal_key = "normalgl" if "normalgl" in entry else "normal" if "normal" in entry else None
+        if normal_key:
+            node_refs["normal_tex"].image = image_cache[entry[normal_key]]
+            node_refs["normal_tex"].mute = False
+        else:
+            node_refs["normal_tex"].mute = True
+
+        # Mute the color_tex node=False to ensure it's active
+        node_refs["color_tex"].mute = False
+
+        return f"cc:{entry['name']}"
     else:
-        obj.replace_materials(fallback_mat)
-        fallback_mat.set_principled_shader_value("Base Color", fallback_color)
+        # Use flat color: mute all texture nodes so principled defaults take over
+        node_refs["color_tex"].mute = True
+        node_refs["rough_tex"].mute = True
+        node_refs["normal_tex"].mute = True
+        node_refs["principled"].inputs["Base Color"].default_value = fallback_color
+        node_refs["principled"].inputs["Roughness"].default_value = rng.uniform(0.4, 0.9)
         return f"flat:{fallback_color[:3]}"
 
 
 # ---------------------------------------------------------------------------
-# [IMPROVEMENT 3] Distractor objects
+# [IMPROVEMENT 3] Distractor objects — pre-created pool (no per-scene alloc)
 # ---------------------------------------------------------------------------
-def create_distractor_objects(rng, n_max=MAX_DISTRACTORS):
+DISTRACTOR_COLORS = [
+    [0.02, 0.15, 0.02, 1.0],   # dark green (bottle)
+    [0.60, 0.55, 0.10, 1.0],   # amber (beer bottle)
+    [0.75, 0.75, 0.78, 1.0],   # silver (can)
+    [0.08, 0.08, 0.40, 1.0],   # blue (can)
+    [0.70, 0.05, 0.05, 1.0],   # red (can)
+    [0.90, 0.90, 0.90, 1.0],   # white (paper plate)
+    [0.30, 0.18, 0.08, 1.0],   # brown (cardboard box)
+    [0.85, 0.80, 0.55, 1.0],   # beige (chip bag)
+]
+
+
+def create_distractor_pool(n_max=MAX_DISTRACTORS):
     """
-    Create random distractor objects (bottles, cans, boxes, solo cups) on or
-    near the table. Returns a list of (MeshObject, material) tuples.
+    Pre-create a pool of distractor objects at startup. Each object gets its
+    own material. All start hidden off-screen. Returns list of (obj, mat) tuples.
     """
-    n = rng.integers(0, n_max + 1)
-    distractors = []
-
-    # Common distractor colors
-    distractor_colors = [
-        [0.02, 0.15, 0.02, 1.0],   # dark green (bottle)
-        [0.60, 0.55, 0.10, 1.0],   # amber (beer bottle)
-        [0.75, 0.75, 0.78, 1.0],   # silver (can)
-        [0.08, 0.08, 0.40, 1.0],   # blue (can)
-        [0.70, 0.05, 0.05, 1.0],   # red (can)
-        [0.90, 0.90, 0.90, 1.0],   # white (paper plate)
-        [0.30, 0.18, 0.08, 1.0],   # brown (cardboard box)
-        [0.85, 0.80, 0.55, 1.0],   # beige (chip bag)
-    ]
-
-    for i in range(n):
-        shape_type = rng.integers(4)
-
-        if shape_type == 0:
-            # Tall cylinder (bottle)
-            radius = rng.uniform(0.025, 0.04)
-            height = rng.uniform(0.15, 0.30)
-            obj = bproc.object.create_primitive(
-                "CYLINDER",
-                scale=[radius, radius, height / 2],
-                location=[0, 0, -10],
-            )
-        elif shape_type == 1:
-            # Short cylinder (can)
-            radius = rng.uniform(0.028, 0.035)
-            height = rng.uniform(0.10, 0.13)
-            obj = bproc.object.create_primitive(
-                "CYLINDER",
-                scale=[radius, radius, height / 2],
-                location=[0, 0, -10],
-            )
-        elif shape_type == 2:
-            # Box (snack box, pizza box, etc.)
-            sx = rng.uniform(0.05, 0.15)
-            sy = rng.uniform(0.05, 0.15)
-            sz = rng.uniform(0.02, 0.08)
-            obj = bproc.object.create_primitive(
-                "CUBE",
-                scale=[sx / 2, sy / 2, sz / 2],
-                location=[0, 0, -10],
-            )
-        else:
-            # Sphere (fruit, ball, crumpled napkin)
-            radius = rng.uniform(0.02, 0.05)
-            obj = bproc.object.create_primitive(
-                "SPHERE",
-                scale=[radius, radius, radius],
-                location=[0, 0, -10],
-            )
-
-        # Material
+    pool = []
+    # Create a mix of shapes: cylinders, cubes, spheres
+    shapes = ["CYLINDER", "CYLINDER", "CUBE", "CUBE", "SPHERE", "SPHERE"]
+    for i in range(n_max):
+        shape = shapes[i % len(shapes)]
+        obj = bproc.object.create_primitive(
+            shape,
+            scale=[0.03, 0.03, 0.06],  # default size, will be randomized
+            location=[0, 0, -10],       # hidden
+        )
         mat = bproc.material.create(f"distractor_{i}")
-        color = distractor_colors[rng.integers(len(distractor_colors))]
-        mat.set_principled_shader_value("Base Color", color)
-        mat.set_principled_shader_value("Roughness", float(rng.uniform(0.2, 0.9)))
-        mat.set_principled_shader_value("Metallic", float(rng.uniform(0.0, 0.5)))
+        mat.set_principled_shader_value("Base Color", [0.5, 0.5, 0.5, 1.0])
+        mat.set_principled_shader_value("Roughness", 0.5)
         obj.replace_materials(mat)
+        pool.append((obj, mat))
+    return pool
 
-        # Place: 80% on table, 20% on floor nearby
-        if rng.random() < 0.8:
-            x = rng.uniform(-TABLE_WIDTH / 2 + 0.05, TABLE_WIDTH / 2 - 0.05)
-            y = rng.uniform(-TABLE_LENGTH / 2 + 0.10, TABLE_LENGTH / 2 - 0.10)
-            z = TABLE_HEIGHT + 0.01
+
+def randomize_distractor_pool(rng, pool):
+    """
+    Each scene: pick how many to show (0..len(pool)), randomize their
+    scale/position/color/rotation, hide the rest. No object creation/deletion.
+    Returns count of visible distractors.
+    """
+    n_show = rng.integers(0, len(pool) + 1)
+
+    for i, (obj, mat) in enumerate(pool):
+        if i < n_show:
+            # Randomize scale to simulate different object types
+            sx = rng.uniform(0.02, 0.08)
+            sy = rng.uniform(0.02, 0.08)
+            sz = rng.uniform(0.03, 0.15)
+            obj.set_scale([sx, sy, sz])
+
+            # Randomize color
+            color = list(DISTRACTOR_COLORS[rng.integers(len(DISTRACTOR_COLORS))])
+            mat.set_principled_shader_value("Base Color", color)
+            mat.set_principled_shader_value("Roughness", float(rng.uniform(0.2, 0.9)))
+            mat.set_principled_shader_value("Metallic", float(rng.uniform(0.0, 0.5)))
+
+            # Place: 80% on table, 20% on floor
+            if rng.random() < 0.8:
+                x = rng.uniform(-TABLE_WIDTH / 2 + 0.05, TABLE_WIDTH / 2 - 0.05)
+                y = rng.uniform(-TABLE_LENGTH / 2 + 0.10, TABLE_LENGTH / 2 - 0.10)
+                z = TABLE_HEIGHT + 0.01
+            else:
+                x = rng.uniform(-1.5, 1.5)
+                y = rng.uniform(-2.0, 2.0)
+                z = 0.01
+            obj.set_location([x, y, z])
+
+            # Random rotation (15% tipped)
+            if rng.random() < 0.15:
+                obj.set_rotation_euler([
+                    rng.uniform(0, 2 * np.pi),
+                    rng.uniform(0, 2 * np.pi),
+                    rng.uniform(0, 2 * np.pi),
+                ])
+            else:
+                obj.set_rotation_euler([0, 0, rng.uniform(0, 2 * np.pi)])
         else:
-            x = rng.uniform(-1.5, 1.5)
-            y = rng.uniform(-2.0, 2.0)
-            z = 0.01
+            # Hide off-screen
+            obj.set_location([0, 0, -10])
 
-        obj.set_location([x, y, z])
-
-        # Random rotation for objects on their side
-        if rng.random() < 0.15:
-            obj.set_rotation_euler([
-                rng.uniform(0, 2 * np.pi),
-                rng.uniform(0, 2 * np.pi),
-                rng.uniform(0, 2 * np.pi),
-            ])
-
-        distractors.append((obj, mat))
-
-    return distractors
-
-
-def remove_distractor_objects(distractors):
-    """Remove all distractor objects and their materials from the scene."""
-    for obj, mat in distractors:
-        bpy_obj = obj.blender_obj
-        if bpy_obj and bpy_obj.name in bpy.data.objects:
-            bpy.data.objects.remove(bpy_obj, do_unlink=True)
-        # Clean up material
-        bpy_mat = mat.blender_obj if hasattr(mat, 'blender_obj') else None
-        if bpy_mat and bpy_mat.name in bpy.data.materials:
-            bpy.data.materials.remove(bpy_mat)
+    return n_show
 
 
 # ---------------------------------------------------------------------------
@@ -775,8 +901,8 @@ def main():
     bproc.renderer.set_max_amount_of_samples(RENDER_SAMPLES)
     bproc.renderer.set_noise_threshold(0.1)
     bproc.renderer.set_light_bounces(
-        diffuse_bounces=3, glossy_bounces=3, max_bounces=6,
-        transparent_max_bounces=8,
+        diffuse_bounces=2, glossy_bounces=2, max_bounces=4,
+        transparent_max_bounces=4,
     )
 
     # Camera intrinsics (set once)
@@ -789,17 +915,21 @@ def main():
     bproc.camera.set_intrinsics_from_K_matrix(K, RESOLUTION[0], RESOLUTION[1],
                                                clip_start=0.01, clip_end=50)
 
-    # --- [IMPROVEMENT 1] Discover HDRI files ---
+    # --- [IMPROVEMENT 1] Pre-load HDRI environment maps ---
     hdri_files = discover_hdri_files(hdri_dir)
-    if hdri_files:
-        print(f"Found {len(hdri_files)} HDRI environment maps")
-    else:
+    hdri_mgr = HDRIManager(hdri_files)
+    if not hdri_files:
         print("No HDRIs found - using flat color backgrounds. "
               "Run download_assets.py to enable HDRI backgrounds.")
 
-    # --- [IMPROVEMENT 2] Load CC texture materials ---
-    cc_materials = load_cc_materials_if_available(cctextures_dir)
-    if not cc_materials:
+    # --- [IMPROVEMENT 2] Discover and preload CC texture images ---
+    cc_texture_entries = discover_cc_texture_images(cctextures_dir)
+    if cc_texture_entries:
+        print(f"Found {len(cc_texture_entries)} CC texture assets, preloading images...")
+        cc_image_cache = preload_cc_images(cc_texture_entries)
+        print(f"Preloaded {len(cc_image_cache)} texture images into memory")
+    else:
+        cc_image_cache = {}
         print("No CC textures found - using flat color surfaces. "
               "Run download_assets.py to enable PBR textures.")
 
@@ -833,14 +963,13 @@ def main():
     cup_template.set_location([0, 0, -10])
 
     # --- Create persistent scene objects ---
-    # Table
+    # Table — uses persistent PBR material (image-swap only, no shader recompile)
     table_top = bproc.object.create_primitive(
         "CUBE",
         scale=[TABLE_WIDTH / 2, TABLE_LENGTH / 2, 0.02],
         location=[0, 0, TABLE_HEIGHT - 0.02],
     )
-    table_mat = bproc.material.create("table_surface")
-    table_mat.set_principled_shader_value("Roughness", 0.6)
+    table_mat, table_nodes = create_pbr_surface_material("table_surface")
     table_top.replace_materials(table_mat)
 
     # Legs
@@ -861,12 +990,11 @@ def main():
         leg.replace_materials(leg_mat)
         legs.append(leg)
 
-    # Floor
+    # Floor — uses persistent PBR material (image-swap only, no shader recompile)
     floor = bproc.object.create_primitive(
         "PLANE", scale=[5, 5, 1], location=[0, 0, 0]
     )
-    floor_mat = bproc.material.create("floor")
-    floor_mat.set_principled_shader_value("Roughness", 0.9)
+    floor_mat, floor_nodes = create_pbr_surface_material("floor")
     floor.replace_materials(floor_mat)
 
     # Ping pong balls (reused across scenes)
@@ -890,17 +1018,19 @@ def main():
     back.set_type("POINT")
     lights = [key, fill, back]
 
+    # --- [IMPROVEMENT 3] Pre-create distractor object pool ---
+    distractor_pool = create_distractor_pool()
+
     print(f"Scene initialized. Generating {args.num_scenes} scenes "
           f"x {args.views_per_scene} views = "
           f"{args.num_scenes * args.views_per_scene} images")
     print(f"Domain randomization: HDRIs={len(hdri_files)}, "
-          f"CC_textures={len(cc_materials)}, "
+          f"CC_textures={len(cc_texture_entries)}, "
           f"cup_presets={len(CUP_MATERIAL_PRESETS)}, "
           f"max_distractors={MAX_DISTRACTORS}, "
           f"post_processing=enabled")
 
     total_start = time.time()
-    prev_distractors = []
 
     for scene_i in range(args.start_scene, args.start_scene + args.num_scenes):
         scene_start = time.time()
@@ -911,23 +1041,23 @@ def main():
         # --- [IMPROVEMENT 1] HDRI background ---
         # 75% HDRI, 25% flat color (for diversity)
         if hdri_files and rng.random() < 0.75:
-            hdri_name = random_hdri(rng, hdri_files)
+            hdri_mgr.enable_hdri()
+            hdri_name = hdri_mgr.set_hdri(rng)
         else:
-            clear_hdri_background()
+            hdri_mgr.disable_hdri()
             bg = random_background_color(rng)
             bproc.renderer.set_world_background(bg, strength=1)
             hdri_name = None
 
-        # --- [IMPROVEMENT 2] Randomize table/floor textures ---
+        # --- [IMPROVEMENT 2] Randomize table/floor textures (image-swap, no recompile) ---
         tc = random_table_color(rng)
-        table_tex_desc = random_cc_texture_for_surface(
-            rng, cc_materials, table_top, table_mat, tc)
-        # Legs always match the flat table color (CC textures don't tile well on thin legs)
+        table_tex_desc = apply_cc_texture_to_surface(
+            rng, cc_texture_entries, cc_image_cache, table_nodes, tc)
         leg_mat.set_principled_shader_value("Base Color", tc)
 
         fc = random_floor_color(rng)
-        floor_tex_desc = random_cc_texture_for_surface(
-            rng, cc_materials, floor, floor_mat, fc)
+        floor_tex_desc = apply_cc_texture_to_surface(
+            rng, cc_texture_entries, cc_image_cache, floor_nodes, fc)
 
         # Lighting
         random_lighting(rng, lights)
@@ -951,9 +1081,8 @@ def main():
 
         cups, cup_meta = randomize_cups(rng, cup_template, cup_spacing)
 
-        # --- [IMPROVEMENT 3] Distractor objects ---
-        remove_distractor_objects(prev_distractors)
-        prev_distractors = create_distractor_objects(rng)
+        # --- [IMPROVEMENT 3] Distractor objects (pooled) ---
+        n_distractors = randomize_distractor_pool(rng, distractor_pool)
 
         # --- Camera poses ---
         cam_obj = bpy.context.scene.camera
@@ -1021,7 +1150,7 @@ def main():
                 'floor_surface': floor_tex_desc,
                 'hdri': hdri_name,
                 'dof_enabled': dof_enabled,
-                'n_distractors': len(prev_distractors),
+                'n_distractors': int(n_distractors),
             }
 
             with open(os.path.join(labels_dir, f"{img_name}.json"), 'w') as f:
@@ -1037,10 +1166,7 @@ def main():
               f"{elapsed:.1f}s | avg {avg_per_scene:.1f}s/scene | "
               f"ETA {remaining / 60:.1f}min | "
               f"cup={cup_preset_name} hdri={'yes' if hdri_name else 'no'} "
-              f"dist={len(prev_distractors)}")
-
-    # Clean up last scene's distractors
-    remove_distractor_objects(prev_distractors)
+              f"dist={n_distractors}")
 
     total_time = time.time() - total_start
     total_images = args.num_scenes * args.views_per_scene

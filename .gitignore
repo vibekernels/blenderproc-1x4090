@@ -2,3 +2,4 @@ output
 .venv
 yolo*.pt
 __pycache__
+assets/

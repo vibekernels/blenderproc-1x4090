@@ -83,6 +83,17 @@ mkdir -p "$OUTPUT_DIR/images" "$OUTPUT_DIR/labels"
 LOG_DIR="$OUTPUT_DIR/logs"
 mkdir -p "$LOG_DIR"
 
+# --- Warm up Blender installation (avoid race condition) ---
+# BlenderProc downloads and extracts Blender on first run. If multiple workers
+# start simultaneously, they race on directory creation and extraction.
+# Run a no-op script first to ensure Blender is fully installed.
+echo "Warming up Blender installation..."
+WARMUP_SCRIPT=$(mktemp /tmp/bproc_warmup_XXXX.py)
+echo 'import blenderproc; blenderproc.init(); print("Blender ready")' > "$WARMUP_SCRIPT"
+blenderproc run "$WARMUP_SCRIPT" 2>&1 | tail -1
+rm -f "$WARMUP_SCRIPT"
+echo ""
+
 # --- Launch workers ---
 PIDS=()
 START=0
