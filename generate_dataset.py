@@ -174,18 +174,19 @@ def random_background_color(rng):
 def random_camera_pose(rng):
     """
     Generate a random camera pose around the beer pong table.
-    Camera is at roughly humanoid height (1.5-1.9m) looking at the table.
+    Includes close-up shots, low angles, and high/overhead perspectives
+    in addition to standard human-height views.
     """
     # Random angle around the table
     angle = rng.uniform(0, 2 * np.pi)
 
-    # Distance from table center (standing near table edge to a few steps back)
+    # Distance from table center — includes close-ups (0.4m) to far back (2.5m)
     # Table extends to ~1.22m in Y, ~0.305m in X
-    distance = rng.uniform(1.0, 2.5)
+    distance = rng.uniform(0.4, 2.5)
 
     cam_x = distance * np.sin(angle)
     cam_y = distance * np.cos(angle)
-    cam_z = rng.uniform(1.50, 1.90)  # humanoid head height range
+    cam_z = rng.uniform(0.6, 2.5)  # low angle (table-level) to overhead
 
     # Look at a point on the table (with some randomness)
     look_x = rng.uniform(-0.15, 0.15)
@@ -786,75 +787,78 @@ def setup_dof(rng, cam_pos, look_target):
 # ---------------------------------------------------------------------------
 # [IMPROVEMENT 5] Cup material variation
 # ---------------------------------------------------------------------------
-# Realistic cup color/material presets
+# Red cup shade presets — HSV shifts applied to the original texture so the
+# white interior is preserved (only saturated red regions are affected).
+# hue: 0.5 = no shift; saturation: 1.0 = original; value: 1.0 = original brightness
 CUP_MATERIAL_PRESETS = [
-    # (name, base_color, roughness, metallic, alpha, transmission)
-    # Classic red Solo cup
-    {"name": "red_solo",      "color": [0.70, 0.04, 0.04, 1.0], "roughness": 0.35, "metallic": 0.0, "alpha": 1.0, "transmission": 0.0},
-    {"name": "red_dark",      "color": [0.50, 0.02, 0.02, 1.0], "roughness": 0.30, "metallic": 0.0, "alpha": 1.0, "transmission": 0.0},
-    {"name": "red_bright",    "color": [0.85, 0.08, 0.05, 1.0], "roughness": 0.40, "metallic": 0.0, "alpha": 1.0, "transmission": 0.0},
-    # Blue cups
-    {"name": "blue_solo",     "color": [0.04, 0.08, 0.65, 1.0], "roughness": 0.35, "metallic": 0.0, "alpha": 1.0, "transmission": 0.0},
-    {"name": "blue_dark",     "color": [0.02, 0.04, 0.45, 1.0], "roughness": 0.30, "metallic": 0.0, "alpha": 1.0, "transmission": 0.0},
-    # Green cups
-    {"name": "green_solo",    "color": [0.04, 0.50, 0.08, 1.0], "roughness": 0.35, "metallic": 0.0, "alpha": 1.0, "transmission": 0.0},
-    # Yellow cups
-    {"name": "yellow_solo",   "color": [0.85, 0.75, 0.05, 1.0], "roughness": 0.35, "metallic": 0.0, "alpha": 1.0, "transmission": 0.0},
-    # Orange cups
-    {"name": "orange_solo",   "color": [0.90, 0.40, 0.05, 1.0], "roughness": 0.35, "metallic": 0.0, "alpha": 1.0, "transmission": 0.0},
-    # Pink cups
-    {"name": "pink_solo",     "color": [0.85, 0.20, 0.50, 1.0], "roughness": 0.35, "metallic": 0.0, "alpha": 1.0, "transmission": 0.0},
-    # Black cups
-    {"name": "black_solo",    "color": [0.03, 0.03, 0.03, 1.0], "roughness": 0.30, "metallic": 0.0, "alpha": 1.0, "transmission": 0.0},
-    # White/frost cups
-    {"name": "white_opaque",  "color": [0.90, 0.90, 0.90, 1.0], "roughness": 0.40, "metallic": 0.0, "alpha": 1.0, "transmission": 0.0},
-    # Clear/translucent cups
-    {"name": "clear_cup",     "color": [0.95, 0.95, 0.95, 1.0], "roughness": 0.10, "metallic": 0.0, "alpha": 0.3, "transmission": 0.8},
-    {"name": "frosted_clear", "color": [0.90, 0.90, 0.92, 1.0], "roughness": 0.30, "metallic": 0.0, "alpha": 0.5, "transmission": 0.5},
-    # Metallic/party cups
-    {"name": "gold_metallic", "color": [0.80, 0.65, 0.15, 1.0], "roughness": 0.20, "metallic": 0.7, "alpha": 1.0, "transmission": 0.0},
-    {"name": "silver_metal",  "color": [0.75, 0.75, 0.78, 1.0], "roughness": 0.20, "metallic": 0.7, "alpha": 1.0, "transmission": 0.0},
+    {"name": "red_solo",    "hue": 0.500, "saturation": 1.00, "value": 1.00},  # original model red
+    {"name": "red_dark",    "hue": 0.500, "saturation": 1.10, "value": 0.75},  # darker
+    {"name": "red_bright",  "hue": 0.500, "saturation": 0.90, "value": 1.20},  # brighter/lighter
+    {"name": "red_deep",    "hue": 0.500, "saturation": 1.20, "value": 0.80},  # deep/saturated
+    {"name": "red_faded",   "hue": 0.500, "saturation": 0.70, "value": 1.10},  # washed-out/faded
+    {"name": "red_warm",    "hue": 0.520, "saturation": 1.00, "value": 1.00},  # slightly orange shift
+    {"name": "red_cool",    "hue": 0.480, "saturation": 1.00, "value": 1.00},  # slightly pink/cool shift
+    {"name": "red_cherry",  "hue": 0.490, "saturation": 1.15, "value": 0.90},  # cherry
 ]
+
+# Reference to the HSV node once inserted (set up on first call)
+_cup_hsv_node = None
 
 
 def randomize_cup_material(rng, cup_template):
     """
-    Apply a random cup material preset to the cup template, with additional
-    per-scene jitter. Returns the chosen preset name for metadata.
+    Randomize the cup's red shade by inserting/updating a Hue Saturation Value
+    node between the base color texture and the Principled BSDF.  The white
+    interior is unaffected because HSV shifts only move chromatic pixels.
+    Returns the chosen preset name for metadata.
     """
+    global _cup_hsv_node
+
     preset = CUP_MATERIAL_PRESETS[rng.integers(len(CUP_MATERIAL_PRESETS))]
 
-    # Get or create the cup material
     bpy_obj = cup_template.blender_obj
-    if not bpy_obj.data.materials:
-        mat = bproc.material.create("cup_material")
-        bpy_obj.data.materials.append(mat.blender_obj)
-    else:
-        mat = bproc.python.types.MaterialUtility.Material(bpy_obj.data.materials[0])
+    bpy_mat = bpy_obj.data.materials[0]
+    nodes = bpy_mat.node_tree.nodes
+    links = bpy_mat.node_tree.links
 
-    # Apply base properties with slight jitter
-    color = list(preset["color"])
-    for i in range(3):
-        color[i] = np.clip(color[i] + rng.uniform(-0.05, 0.05), 0, 1)
-    mat.set_principled_shader_value("Base Color", color)
+    # --- One-time setup: insert HSV node between texture and BSDF ---
+    if _cup_hsv_node is None:
+        principled = None
+        tex_node = None
+        tex_link = None
+        for node in nodes:
+            if node.type == 'BSDF_PRINCIPLED':
+                principled = node
+        # Find the link feeding Base Color
+        bc_input = principled.inputs['Base Color']
+        for link in links:
+            if link.to_socket == bc_input:
+                tex_link = link
+                tex_node = link.from_node
+                tex_output = link.from_socket
+                break
 
-    roughness = np.clip(preset["roughness"] + rng.uniform(-0.05, 0.05), 0.05, 1.0)
-    mat.set_principled_shader_value("Roughness", float(roughness))
+        hsv = nodes.new('ShaderNodeHueSaturation')
+        hsv.name = 'CupHSVShift'
+        hsv.location = (principled.location.x - 200, principled.location.y)
 
-    metallic = np.clip(preset["metallic"] + rng.uniform(-0.05, 0.05), 0.0, 1.0)
-    mat.set_principled_shader_value("Metallic", float(metallic))
+        # Rewire: texture -> HSV -> principled
+        if tex_link:
+            links.remove(tex_link)
+            links.new(tex_output, hsv.inputs['Color'])
+        links.new(hsv.outputs['Color'], bc_input)
 
-    alpha = float(preset["alpha"])
-    mat.set_principled_shader_value("Alpha", alpha)
+        _cup_hsv_node = hsv
 
-    transmission = float(preset["transmission"])
-    mat.set_principled_shader_value("Transmission Weight", transmission)
+    # --- Per-scene: update HSV values with jitter ---
+    hue = np.clip(preset["hue"] + rng.uniform(-0.02, 0.02), 0.0, 1.0)
+    saturation = np.clip(preset["saturation"] + rng.uniform(-0.10, 0.10), 0.5, 1.5)
+    value = np.clip(preset["value"] + rng.uniform(-0.10, 0.10), 0.6, 1.4)
 
-    # For transparent cups, set blend mode
-    bpy_mat = mat.blender_obj
-    if alpha < 1.0 or transmission > 0.0:
-        bpy_mat.blend_method = 'HASHED'
-        bpy_mat.shadow_method = 'HASHED'
+    _cup_hsv_node.inputs['Hue'].default_value = float(hue)
+    _cup_hsv_node.inputs['Saturation'].default_value = float(saturation)
+    _cup_hsv_node.inputs['Value'].default_value = float(value)
+    _cup_hsv_node.inputs['Fac'].default_value = 1.0
 
     return preset["name"]
 
