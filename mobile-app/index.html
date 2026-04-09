@@ -71,17 +71,7 @@
     margin: 0 auto 12px;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
-  #start-btn {
-    padding: 12px 32px;
-    font-size: 16px;
-    background: #e94560;
-    color: #fff;
-    border: none;
-    border-radius: 8px;
-    cursor: pointer;
-  }
-  #start-btn:active { background: #c73e54; }
-  #conf-slider {
+#conf-slider {
     position: absolute;
     bottom: 12px; left: 16px; right: 16px;
     z-index: 10;
@@ -95,12 +85,26 @@
   #conf-slider label { font-size: 12px; white-space: nowrap; }
   #conf-slider input[type=range] { flex: 1; }
   #conf-val { font-size: 12px; min-width: 36px; text-align: right; }
+  #debug-log {
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    max-height: 40%;
+    overflow-y: auto;
+    z-index: 30;
+    background: rgba(0,0,0,0.8);
+    font-family: monospace;
+    font-size: 11px;
+    line-height: 1.4;
+    padding: 4px 8px;
+    color: #0f0;
+    pointer-events: none;
+  }
 </style>
 </head>
 <body>
 
 <div id="header">
-  <h1>Beer Pong Detector</h1>
+  <h1>Beer Pong Detector <small style="opacity:0.4;font-size:11px">v10</small></h1>
   <select id="camera-select"><option value="">Loading cameras…</option></select>
   <span id="stats">--</span>
 </div>
@@ -111,8 +115,8 @@
 
   <div id="overlay">
     <div id="overlay-content">
-      <p id="overlay-msg">Tap Start to begin</p>
-      <button id="start-btn">Start</button>
+      <div class="spinner"></div>
+      <p id="overlay-msg">Starting…</p>
     </div>
   </div>
 
@@ -121,19 +125,46 @@
     <input type="range" id="conf" min="0.1" max="0.95" step="0.05" value="0.45">
     <span id="conf-val">0.45</span>
   </div>
+  <div id="debug-log"></div>
 </div>
 
-<!-- ONNX Runtime Web -->
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.3/dist/ort.min.js"></script>
 <script>
+// ─── Debug logging (visible on screen) ────────────────────────
+const debugLog = document.getElementById("debug-log");
+const MAX_LOG_LINES = 30;
+const logStartTime = Date.now();
+function log(msg) {
+  const t = ((Date.now() - logStartTime) / 1000).toFixed(1);
+  const line = `[${t}s] ${msg}`;
+  console.log(line);
+  debugLog.textContent += line + "\n";
+  // Keep only last N lines
+  const lines = debugLog.textContent.split("\n");
+  if (lines.length > MAX_LOG_LINES) {
+    debugLog.textContent = lines.slice(-MAX_LOG_LINES).join("\n");
+  }
+  debugLog.scrollTop = debugLog.scrollHeight;
+}
+
+// Catch all uncaught errors
+window.onerror = (msg, src, line, col, err) => {
+  log(`UNCAUGHT ERROR: ${msg} at ${src}:${line}:${col}`);
+};
+window.onunhandledrejection = (e) => {
+  log(`UNHANDLED REJECTION: ${e.reason}`);
+};
+
+const CAMERA_ONLY = new URLSearchParams(location.search).has("camera-only");
+if (CAMERA_ONLY) log("*** CAMERA-ONLY MODE — no inference ***");
+
 // ─── Config ────────────────────────────────────────────────────
 const MODEL_URL = "model/best.onnx";
 const CLASSES_URL = "model/classes.json";
-const MODEL_INPUT_SIZE = 640;
+const MODEL_INPUT_SIZE = 320;
 const IOU_THRESHOLD = 0.5;
 let CONF_THRESHOLD = 0.45;
+const WORKER_RESET_FRAMES = 100; // terminate & restart worker to free WASM memory
 
-// Nice distinct colors for up to 20 classes
 const COLORS = [
   "#e94560","#0f3460","#00b4d8","#e9c46a","#2a9d8f",
   "#e76f51","#6a4c93","#1982c4","#8ac926","#ff595e",
@@ -142,17 +173,18 @@ const COLORS = [
 ];
 
 // ─── State ─────────────────────────────────────────────────────
-let session = null;
 let classNames = {};
 let running = false;
 let currentStream = null;
+let worker = null;
+let pendingInference = null; // resolve callback for current inference
+let frameCount = 0;
 
 const video = document.getElementById("video");
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
 const overlay = document.getElementById("overlay");
 const overlayMsg = document.getElementById("overlay-msg");
-const startBtn = document.getElementById("start-btn");
 const statsEl = document.getElementById("stats");
 const confSlider = document.getElementById("conf");
 const confVal = document.getElementById("conf-val");
@@ -185,32 +217,14 @@ async function startCamera(deviceId) {
   }
   const constraints = {
     video: deviceId
-      ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
-      : { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+      ? { deviceId: { exact: deviceId }, width: { ideal: 640 }, height: { ideal: 480 } }
+      : { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 480 } },
     audio: false,
   };
   currentStream = await navigator.mediaDevices.getUserMedia(constraints);
   video.srcObject = currentStream;
   await video.play();
 }
-
-// Request camera permission on load so the camera list is populated immediately
-async function requestPermissionAndEnumerate() {
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: "environment" },
-      audio: false,
-    });
-    const backDeviceId = stream.getVideoTracks()[0]?.getSettings().deviceId;
-    stream.getTracks().forEach(t => t.stop());
-    await enumerateCameras();
-    if (backDeviceId) cameraSelect.value = backDeviceId;
-  } catch (e) {
-    // Permission denied or unavailable — leave the placeholder; Start will try again
-    console.warn("Camera pre-permission failed:", e);
-  }
-}
-requestPermissionAndEnumerate();
 
 cameraSelect.addEventListener("change", async () => {
   try {
@@ -220,37 +234,67 @@ cameraSelect.addEventListener("change", async () => {
   }
 });
 
-// ─── Model loading ─────────────────────────────────────────────
-async function loadModel() {
-  overlayMsg.innerHTML = '<div class="spinner"></div><p>Loading model…</p>';
-  startBtn.style.display = "none";
+// ─── Inference worker ─────────────────────────────────────────
+function createWorker() {
+  return new Promise(async (resolve, reject) => {
+    log("Fetching model…");
+    const modelResp = await fetch(MODEL_URL);
+    const modelBuffer = await modelResp.arrayBuffer();
+    log(`Model fetched: ${(modelBuffer.byteLength / 1048576).toFixed(1)}MB`);
 
-  // Load class names
-  try {
-    const resp = await fetch(CLASSES_URL);
-    classNames = await resp.json();
-  } catch {
-    // Fallback: try to read from model metadata, or use generic
-    classNames = { 0: "object" };
-  }
-
-  // Configure ONNX Runtime
-  ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.3/dist/";
-
-  session = await ort.InferenceSession.create(MODEL_URL, {
-    executionProviders: ["webgl", "wasm"],
-    graphOptimizationLevel: "all",
+    const w = new Worker("worker.js");
+    w.onmessage = (e) => {
+      if (e.data.type === "ready") {
+        log("Worker ready");
+        worker = w;
+        resolve();
+      } else if (e.data.type === "result") {
+        if (pendingInference) {
+          pendingInference({
+            data: new Float32Array(e.data.data),
+            dims: e.data.dims,
+          });
+          pendingInference = null;
+        }
+      } else if (e.data.type === "error") {
+        log(`WORKER ERROR: ${e.data.message}`);
+        if (pendingInference) {
+          pendingInference = null;
+        }
+      }
+    };
+    w.onerror = (e) => {
+      log(`WORKER ONERROR: ${e.message || e}`);
+      reject(e);
+    };
+    // Transfer model buffer to worker (zero-copy)
+    w.postMessage({ type: "init", modelBuffer }, [modelBuffer]);
   });
+}
 
-  console.log("Model loaded. Inputs:", session.inputNames, "Outputs:", session.outputNames);
+function runInference(float32Data) {
+  return new Promise((resolve) => {
+    pendingInference = resolve;
+    const copy = float32Data.buffer.slice(0);
+    worker.postMessage(
+      { type: "infer", inputBuffer: copy, dims: [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE] },
+      [copy]
+    );
+  });
+}
+
+async function resetWorker() {
+  log(`Resetting worker at frame ${frameCount}…`);
+  if (worker) worker.terminate();
+  await createWorker();
+  log("Worker reset complete");
 }
 
 // ─── Preprocessing ─────────────────────────────────────────────
-// Reuse offscreen canvas and pixel buffer across frames to avoid per-frame allocations
 const offscreen = document.createElement("canvas");
 offscreen.width = MODEL_INPUT_SIZE;
 offscreen.height = MODEL_INPUT_SIZE;
-const octx = offscreen.getContext("2d");
+const octx = offscreen.getContext("2d", { willReadFrequently: true });
 const float32Data = new Float32Array(3 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE);
 const pixelCount = MODEL_INPUT_SIZE * MODEL_INPUT_SIZE;
 
@@ -263,21 +307,16 @@ function preprocess(video) {
     float32Data[pixelCount + i]     = data[i * 4 + 1] / 255.0; // G
     float32Data[2 * pixelCount + i] = data[i * 4 + 2] / 255.0; // B
   }
-
-  return new ort.Tensor("float32", float32Data, [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
 }
 
 // ─── Post-processing (YOLOv8 output format) ────────────────────
 function postprocess(output, videoWidth, videoHeight) {
-  // YOLOv8 output shape: [1, (4 + num_classes), num_detections]
-  // Transpose to [num_detections, (4 + num_classes)]
   const data = output.data;
   const [, channels, numDetections] = output.dims;
   const numClasses = channels - 4;
 
   const boxes = [];
   for (let i = 0; i < numDetections; i++) {
-    // Get class scores
     let maxScore = 0;
     let classId = 0;
     for (let c = 0; c < numClasses; c++) {
@@ -290,13 +329,11 @@ function postprocess(output, videoWidth, videoHeight) {
 
     if (maxScore < CONF_THRESHOLD) continue;
 
-    // Box is in xywh format (center x, center y, width, height) relative to 640x640
     const cx = data[0 * numDetections + i];
     const cy = data[1 * numDetections + i];
     const w  = data[2 * numDetections + i];
     const h  = data[3 * numDetections + i];
 
-    // Scale to video display dimensions
     const scaleX = videoWidth / MODEL_INPUT_SIZE;
     const scaleY = videoHeight / MODEL_INPUT_SIZE;
 
@@ -310,7 +347,6 @@ function postprocess(output, videoWidth, videoHeight) {
     });
   }
 
-  // NMS
   return nms(boxes, IOU_THRESHOLD);
 }
 
@@ -345,27 +381,27 @@ function iou(a, b) {
 
 // ─── Drawing ───────────────────────────────────────────────────
 function drawBoxes(detections) {
-  canvas.width = canvas.clientWidth;
-  canvas.height = canvas.clientHeight;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
   for (const det of detections) {
     const color = COLORS[det.classId % COLORS.length];
     const label = `${classNames[det.classId] || `class${det.classId}`} ${(det.score * 100).toFixed(0)}%`;
 
-    // Box
     ctx.strokeStyle = color;
     ctx.lineWidth = 3;
     ctx.strokeRect(det.x1, det.y1, det.x2 - det.x1, det.y2 - det.y1);
 
-    // Label background
     ctx.font = "bold 14px -apple-system, sans-serif";
     const textWidth = ctx.measureText(label).width;
     const labelHeight = 20;
     ctx.fillStyle = color;
     ctx.fillRect(det.x1, det.y1 - labelHeight, textWidth + 8, labelHeight);
 
-    // Label text
     ctx.fillStyle = "#fff";
     ctx.fillText(label, det.x1 + 4, det.y1 - 5);
   }
@@ -377,45 +413,77 @@ async function detectLoop() {
 
   const t0 = performance.now();
 
-  const inputTensor = preprocess(video);
-  const feeds = { [session.inputNames[0]]: inputTensor };
-  let results;
   try {
-    results = await session.run(feeds);
-  } finally {
-    inputTensor.dispose();
+    // Periodically kill and restart the worker — this is the ONLY way to
+    // truly free WASM linear memory (it can grow but never shrink).
+    if (++frameCount % WORKER_RESET_FRAMES === 0) {
+      await resetWorker();
+    }
+
+    preprocess(video);
+    const output = await runInference(float32Data);
+    const detections = postprocess(output, canvas.clientWidth, canvas.clientHeight);
+
+    drawBoxes(detections);
+
+    const dt = performance.now() - t0;
+    statsEl.textContent = `${dt.toFixed(0)}ms · ${(1000 / dt).toFixed(1)} FPS · ${detections.length} cup · f${frameCount}`;
+    // Log every 10th frame to track progress without spamming
+    if (frameCount % 10 === 0) {
+      log(`frame ${frameCount} · ${dt.toFixed(0)}ms · ${detections.length} det`);
+    }
+  } catch (err) {
+    log(`DETECT ERROR at frame ${frameCount}: ${err.message || err}`);
+    statsEl.textContent = `error: ${err.message}`;
   }
-
-  const output = results[session.outputNames[0]];
-  const detections = postprocess(output, canvas.clientWidth, canvas.clientHeight);
-
-  // Dispose all output tensors
-  for (const t of Object.values(results)) t.dispose();
-
-  drawBoxes(detections);
-
-  const dt = performance.now() - t0;
-  statsEl.textContent = `${dt.toFixed(0)}ms · ${(1000 / dt).toFixed(1)} FPS · ${detections.length} obj`;
 
   requestAnimationFrame(detectLoop);
 }
 
-// ─── Start ─────────────────────────────────────────────────────
-startBtn.addEventListener("click", async () => {
+// ─── Auto-start ───────────────────────────────────────────────
+async function autoStart() {
   try {
-    await startCamera(cameraSelect.value || undefined);
-    await loadModel();
+    log("autoStart: requesting camera…");
+    overlayMsg.textContent = "Starting camera…";
+    await startCamera();
+    log("autoStart: camera started");
+    const activeId = currentStream.getVideoTracks()[0]?.getSettings().deviceId;
+    await enumerateCameras();
+    if (activeId) cameraSelect.value = activeId;
 
-    overlay.classList.add("hidden");
-    running = true;
-    detectLoop();
+    overlayMsg.textContent = "Loading model…";
+    if (CAMERA_ONLY) {
+      overlay.classList.add("hidden");
+      running = true;
+      log("autoStart: camera-only mode, logging every 5s");
+      const camStart = Date.now();
+      setInterval(() => {
+        const elapsed = ((Date.now() - camStart) / 1000).toFixed(0);
+        log(`camera alive at ${elapsed}s`);
+      }, 5000);
+    } else {
+      log("autoStart: loading class names…");
+      try {
+        const resp = await fetch(CLASSES_URL);
+        classNames = await resp.json();
+      } catch {
+        classNames = { 0: "object" };
+      }
+      log("autoStart: creating worker…");
+      await createWorker();
+
+      overlay.classList.add("hidden");
+      running = true;
+      log("autoStart: detection loop starting");
+      detectLoop();
+    }
   } catch (err) {
+    log(`AUTOSTART ERROR: ${err.message || err}`);
     overlayMsg.textContent = `Error: ${err.message}`;
-    startBtn.style.display = "inline-block";
-    startBtn.textContent = "Retry";
     console.error(err);
   }
-});
+}
+autoStart();
 </script>
 </body>
 </html>
