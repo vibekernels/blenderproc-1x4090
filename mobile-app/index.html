@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Beer Pong Detector</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a2e;
+    color: #eee;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    overflow: hidden;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+  }
+  #header {
+    padding: 8px 16px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #16213e;
+    z-index: 10;
+  }
+  #header h1 { font-size: 16px; font-weight: 600; }
+  #stats { font-size: 13px; opacity: 0.7; }
+  #camera-select {
+    font-size: 13px;
+    background: #0f3460;
+    color: #eee;
+    border: none;
+    padding: 4px 8px;
+    border-radius: 4px;
+  }
+  #container {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+  }
+  #video {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    object-fit: cover;
+  }
+  #canvas {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    z-index: 5;
+  }
+  #overlay {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 20;
+    background: rgba(0,0,0,0.7);
+  }
+  #overlay.hidden { display: none; }
+  #overlay-content { text-align: center; padding: 24px; }
+  #overlay-content p { margin: 8px 0; font-size: 14px; }
+  .spinner {
+    width: 40px; height: 40px;
+    border: 4px solid rgba(255,255,255,0.2);
+    border-top-color: #e94560;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin: 0 auto 12px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #start-btn {
+    padding: 12px 32px;
+    font-size: 16px;
+    background: #e94560;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  #start-btn:active { background: #c73e54; }
+  #conf-slider {
+    position: absolute;
+    bottom: 12px; left: 16px; right: 16px;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(22,33,62,0.85);
+    padding: 8px 12px;
+    border-radius: 8px;
+  }
+  #conf-slider label { font-size: 12px; white-space: nowrap; }
+  #conf-slider input[type=range] { flex: 1; }
+  #conf-val { font-size: 12px; min-width: 36px; text-align: right; }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <h1>Beer Pong Detector</h1>
+  <select id="camera-select"><option value="">Loading cameras…</option></select>
+  <span id="stats">--</span>
+</div>
+
+<div id="container">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+
+  <div id="overlay">
+    <div id="overlay-content">
+      <p id="overlay-msg">Tap Start to begin</p>
+      <button id="start-btn">Start</button>
+    </div>
+  </div>
+
+  <div id="conf-slider">
+    <label>Confidence</label>
+    <input type="range" id="conf" min="0.1" max="0.95" step="0.05" value="0.45">
+    <span id="conf-val">0.45</span>
+  </div>
+</div>
+
+<!-- ONNX Runtime Web -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.3/dist/ort.min.js"></script>
+<script>
+// ─── Config ────────────────────────────────────────────────────
+const MODEL_URL = "model/best.onnx";
+const CLASSES_URL = "model/classes.json";
+const MODEL_INPUT_SIZE = 640;
+const IOU_THRESHOLD = 0.5;
+let CONF_THRESHOLD = 0.45;
+
+// Nice distinct colors for up to 20 classes
+const COLORS = [
+  "#e94560","#0f3460","#00b4d8","#e9c46a","#2a9d8f",
+  "#e76f51","#6a4c93","#1982c4","#8ac926","#ff595e",
+  "#ff924c","#ffca3a","#c77dff","#72efdd","#f72585",
+  "#4cc9f0","#7209b7","#3a0ca3","#4361ee","#4895ef",
+];
+
+// ─── State ─────────────────────────────────────────────────────
+let session = null;
+let classNames = {};
+let running = false;
+let currentStream = null;
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const overlay = document.getElementById("overlay");
+const overlayMsg = document.getElementById("overlay-msg");
+const startBtn = document.getElementById("start-btn");
+const statsEl = document.getElementById("stats");
+const confSlider = document.getElementById("conf");
+const confVal = document.getElementById("conf-val");
+const cameraSelect = document.getElementById("camera-select");
+
+confSlider.addEventListener("input", () => {
+  CONF_THRESHOLD = parseFloat(confSlider.value);
+  confVal.textContent = CONF_THRESHOLD.toFixed(2);
+});
+
+// ─── Camera ────────────────────────────────────────────────────
+async function enumerateCameras() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const videoDevices = devices.filter(d => d.kind === "videoinput");
+  cameraSelect.innerHTML = "";
+  videoDevices.forEach((d, i) => {
+    const opt = document.createElement("option");
+    opt.value = d.deviceId;
+    // Prefer front/user camera by default
+    const label = d.label || `Camera ${i + 1}`;
+    opt.textContent = label;
+    if (label.toLowerCase().includes("front") || label.toLowerCase().includes("facetime")) {
+      opt.selected = true;
+    }
+    cameraSelect.appendChild(opt);
+  });
+  // If nothing was marked front, try environment heuristic, else first camera
+  if (!cameraSelect.value && videoDevices.length > 0) {
+    cameraSelect.value = videoDevices[0].deviceId;
+  }
+}
+
+async function startCamera(deviceId) {
+  if (currentStream) {
+    currentStream.getTracks().forEach(t => t.stop());
+  }
+  const constraints = {
+    video: deviceId
+      ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+      : { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false,
+  };
+  currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+  video.srcObject = currentStream;
+  await video.play();
+}
+
+cameraSelect.addEventListener("change", async () => {
+  try {
+    await startCamera(cameraSelect.value);
+  } catch (e) {
+    console.error("Camera switch failed:", e);
+  }
+});
+
+// ─── Model loading ─────────────────────────────────────────────
+async function loadModel() {
+  overlayMsg.innerHTML = '<div class="spinner"></div><p>Loading model…</p>';
+  startBtn.style.display = "none";
+
+  // Load class names
+  try {
+    const resp = await fetch(CLASSES_URL);
+    classNames = await resp.json();
+  } catch {
+    // Fallback: try to read from model metadata, or use generic
+    classNames = { 0: "object" };
+  }
+
+  // Configure ONNX Runtime
+  ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.3/dist/";
+
+  session = await ort.InferenceSession.create(MODEL_URL, {
+    executionProviders: ["webgl", "wasm"],
+    graphOptimizationLevel: "all",
+  });
+
+  console.log("Model loaded. Inputs:", session.inputNames, "Outputs:", session.outputNames);
+}
+
+// ─── Preprocessing ─────────────────────────────────────────────
+function preprocess(video) {
+  // Draw video frame to an offscreen canvas at model input size
+  const offscreen = document.createElement("canvas");
+  offscreen.width = MODEL_INPUT_SIZE;
+  offscreen.height = MODEL_INPUT_SIZE;
+  const octx = offscreen.getContext("2d");
+  octx.drawImage(video, 0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
+  const imageData = octx.getImageData(0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
+  const { data } = imageData;
+
+  // Convert to float32 CHW format, normalized to [0,1]
+  const float32Data = new Float32Array(3 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE);
+  const pixelCount = MODEL_INPUT_SIZE * MODEL_INPUT_SIZE;
+  for (let i = 0; i < pixelCount; i++) {
+    float32Data[i] = data[i * 4] / 255.0;                    // R
+    float32Data[pixelCount + i] = data[i * 4 + 1] / 255.0;   // G
+    float32Data[2 * pixelCount + i] = data[i * 4 + 2] / 255.0; // B
+  }
+
+  return new ort.Tensor("float32", float32Data, [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
+}
+
+// ─── Post-processing (YOLOv8 output format) ────────────────────
+function postprocess(output, videoWidth, videoHeight) {
+  // YOLOv8 output shape: [1, (4 + num_classes), num_detections]
+  // Transpose to [num_detections, (4 + num_classes)]
+  const data = output.data;
+  const [, channels, numDetections] = output.dims;
+  const numClasses = channels - 4;
+
+  const boxes = [];
+  for (let i = 0; i < numDetections; i++) {
+    // Get class scores
+    let maxScore = 0;
+    let classId = 0;
+    for (let c = 0; c < numClasses; c++) {
+      const score = data[(4 + c) * numDetections + i];
+      if (score > maxScore) {
+        maxScore = score;
+        classId = c;
+      }
+    }
+
+    if (maxScore < CONF_THRESHOLD) continue;
+
+    // Box is in xywh format (center x, center y, width, height) relative to 640x640
+    const cx = data[0 * numDetections + i];
+    const cy = data[1 * numDetections + i];
+    const w  = data[2 * numDetections + i];
+    const h  = data[3 * numDetections + i];
+
+    // Scale to video display dimensions
+    const scaleX = videoWidth / MODEL_INPUT_SIZE;
+    const scaleY = videoHeight / MODEL_INPUT_SIZE;
+
+    boxes.push({
+      x1: (cx - w / 2) * scaleX,
+      y1: (cy - h / 2) * scaleY,
+      x2: (cx + w / 2) * scaleX,
+      y2: (cy + h / 2) * scaleY,
+      score: maxScore,
+      classId,
+    });
+  }
+
+  // NMS
+  return nms(boxes, IOU_THRESHOLD);
+}
+
+function nms(boxes, iouThreshold) {
+  boxes.sort((a, b) => b.score - a.score);
+  const keep = [];
+  const removed = new Set();
+
+  for (let i = 0; i < boxes.length; i++) {
+    if (removed.has(i)) continue;
+    keep.push(boxes[i]);
+    for (let j = i + 1; j < boxes.length; j++) {
+      if (removed.has(j)) continue;
+      if (boxes[i].classId === boxes[j].classId && iou(boxes[i], boxes[j]) > iouThreshold) {
+        removed.add(j);
+      }
+    }
+  }
+  return keep;
+}
+
+function iou(a, b) {
+  const x1 = Math.max(a.x1, b.x1);
+  const y1 = Math.max(a.y1, b.y1);
+  const x2 = Math.min(a.x2, b.x2);
+  const y2 = Math.min(a.y2, b.y2);
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  const areaA = (a.x2 - a.x1) * (a.y2 - a.y1);
+  const areaB = (b.x2 - b.x1) * (b.y2 - b.y1);
+  return inter / (areaA + areaB - inter);
+}
+
+// ─── Drawing ───────────────────────────────────────────────────
+function drawBoxes(detections) {
+  canvas.width = canvas.clientWidth;
+  canvas.height = canvas.clientHeight;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  for (const det of detections) {
+    const color = COLORS[det.classId % COLORS.length];
+    const label = `${classNames[det.classId] || `class${det.classId}`} ${(det.score * 100).toFixed(0)}%`;
+
+    // Box
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 3;
+    ctx.strokeRect(det.x1, det.y1, det.x2 - det.x1, det.y2 - det.y1);
+
+    // Label background
+    ctx.font = "bold 14px -apple-system, sans-serif";
+    const textWidth = ctx.measureText(label).width;
+    const labelHeight = 20;
+    ctx.fillStyle = color;
+    ctx.fillRect(det.x1, det.y1 - labelHeight, textWidth + 8, labelHeight);
+
+    // Label text
+    ctx.fillStyle = "#fff";
+    ctx.fillText(label, det.x1 + 4, det.y1 - 5);
+  }
+}
+
+// ─── Detection loop ────────────────────────────────────────────
+async function detectLoop() {
+  if (!running) return;
+
+  const t0 = performance.now();
+
+  const inputTensor = preprocess(video);
+  const feeds = { [session.inputNames[0]]: inputTensor };
+  const results = await session.run(feeds);
+  const output = results[session.outputNames[0]];
+
+  const detections = postprocess(output, canvas.clientWidth, canvas.clientHeight);
+  drawBoxes(detections);
+
+  const dt = performance.now() - t0;
+  statsEl.textContent = `${dt.toFixed(0)}ms · ${(1000 / dt).toFixed(1)} FPS · ${detections.length} obj`;
+
+  requestAnimationFrame(detectLoop);
+}
+
+// ─── Start ─────────────────────────────────────────────────────
+startBtn.addEventListener("click", async () => {
+  try {
+    // Request camera first (needs user gesture on mobile)
+    await startCamera(cameraSelect.value || undefined);
+    await enumerateCameras();
+    // Re-select current camera after enumeration
+    if (currentStream) {
+      const track = currentStream.getVideoTracks()[0];
+      const activeId = track.getSettings().deviceId;
+      if (activeId) cameraSelect.value = activeId;
+    }
+
+    await loadModel();
+
+    overlay.classList.add("hidden");
+    running = true;
+    detectLoop();
+  } catch (err) {
+    overlayMsg.textContent = `Error: ${err.message}`;
+    startBtn.style.display = "inline-block";
+    startBtn.textContent = "Retry";
+    console.error(err);
+  }
+});
+</script>
+</body>
+</html>
