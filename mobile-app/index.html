@@ -171,15 +171,9 @@ async function enumerateCameras() {
   videoDevices.forEach((d, i) => {
     const opt = document.createElement("option");
     opt.value = d.deviceId;
-    // Prefer front/user camera by default
-    const label = d.label || `Camera ${i + 1}`;
-    opt.textContent = label;
-    if (label.toLowerCase().includes("front") || label.toLowerCase().includes("facetime")) {
-      opt.selected = true;
-    }
+    opt.textContent = d.label || `Camera ${i + 1}`;
     cameraSelect.appendChild(opt);
   });
-  // If nothing was marked front, try environment heuristic, else first camera
   if (!cameraSelect.value && videoDevices.length > 0) {
     cameraSelect.value = videoDevices[0].deviceId;
   }
@@ -192,13 +186,31 @@ async function startCamera(deviceId) {
   const constraints = {
     video: deviceId
       ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
-      : { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+      : { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
     audio: false,
   };
   currentStream = await navigator.mediaDevices.getUserMedia(constraints);
   video.srcObject = currentStream;
   await video.play();
 }
+
+// Request camera permission on load so the camera list is populated immediately
+async function requestPermissionAndEnumerate() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment" },
+      audio: false,
+    });
+    const backDeviceId = stream.getVideoTracks()[0]?.getSettings().deviceId;
+    stream.getTracks().forEach(t => t.stop());
+    await enumerateCameras();
+    if (backDeviceId) cameraSelect.value = backDeviceId;
+  } catch (e) {
+    // Permission denied or unavailable — leave the placeholder; Start will try again
+    console.warn("Camera pre-permission failed:", e);
+  }
+}
+requestPermissionAndEnumerate();
 
 cameraSelect.addEventListener("change", async () => {
   try {
@@ -234,22 +246,21 @@ async function loadModel() {
 }
 
 // ─── Preprocessing ─────────────────────────────────────────────
-function preprocess(video) {
-  // Draw video frame to an offscreen canvas at model input size
-  const offscreen = document.createElement("canvas");
-  offscreen.width = MODEL_INPUT_SIZE;
-  offscreen.height = MODEL_INPUT_SIZE;
-  const octx = offscreen.getContext("2d");
-  octx.drawImage(video, 0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
-  const imageData = octx.getImageData(0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
-  const { data } = imageData;
+// Reuse offscreen canvas and pixel buffer across frames to avoid per-frame allocations
+const offscreen = document.createElement("canvas");
+offscreen.width = MODEL_INPUT_SIZE;
+offscreen.height = MODEL_INPUT_SIZE;
+const octx = offscreen.getContext("2d");
+const float32Data = new Float32Array(3 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE);
+const pixelCount = MODEL_INPUT_SIZE * MODEL_INPUT_SIZE;
 
-  // Convert to float32 CHW format, normalized to [0,1]
-  const float32Data = new Float32Array(3 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE);
-  const pixelCount = MODEL_INPUT_SIZE * MODEL_INPUT_SIZE;
+function preprocess(video) {
+  octx.drawImage(video, 0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
+  const { data } = octx.getImageData(0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
+
   for (let i = 0; i < pixelCount; i++) {
-    float32Data[i] = data[i * 4] / 255.0;                    // R
-    float32Data[pixelCount + i] = data[i * 4 + 1] / 255.0;   // G
+    float32Data[i]                  = data[i * 4]     / 255.0; // R
+    float32Data[pixelCount + i]     = data[i * 4 + 1] / 255.0; // G
     float32Data[2 * pixelCount + i] = data[i * 4 + 2] / 255.0; // B
   }
 
@@ -368,10 +379,19 @@ async function detectLoop() {
 
   const inputTensor = preprocess(video);
   const feeds = { [session.inputNames[0]]: inputTensor };
-  const results = await session.run(feeds);
-  const output = results[session.outputNames[0]];
+  let results;
+  try {
+    results = await session.run(feeds);
+  } finally {
+    inputTensor.dispose();
+  }
 
+  const output = results[session.outputNames[0]];
   const detections = postprocess(output, canvas.clientWidth, canvas.clientHeight);
+
+  // Dispose all output tensors
+  for (const t of Object.values(results)) t.dispose();
+
   drawBoxes(detections);
 
   const dt = performance.now() - t0;
@@ -383,16 +403,7 @@ async function detectLoop() {
 // ─── Start ─────────────────────────────────────────────────────
 startBtn.addEventListener("click", async () => {
   try {
-    // Request camera first (needs user gesture on mobile)
     await startCamera(cameraSelect.value || undefined);
-    await enumerateCameras();
-    // Re-select current camera after enumeration
-    if (currentStream) {
-      const track = currentStream.getVideoTracks()[0];
-      const activeId = track.getSettings().deviceId;
-      if (activeId) cameraSelect.value = activeId;
-    }
-
     await loadModel();
 
     overlay.classList.add("hidden");
