@@ -76,15 +76,32 @@ top. This is characteristic of Blender as a cold-start process.
 
 ---
 
+### Batching more views per scene
+
+Tested rendering 16 views per scene (vs default 4) in a single
+`bproc.renderer.render()` call.  Result: **no speedup**.  The ~13s/frame
+overhead is per-frame, not per-render-call — Blender rebuilds the OptiX
+pipeline for each frame even when camera poses are batched as keyframes.
+
+- 4 views × 1 scene:  ~50s total → 12.5s/image
+- 16 views × 1 scene: ~213s total → 13.3s/image
+
+The original hypothesis that the overhead was a one-time cost per render call
+was incorrect.
+
 ## How to actually go faster
 
-The only lever that would make a material difference is **rendering multiple
-scene variations in a single Blender session**. Currently each `render.sh`
-invocation pays the full ~49s overhead for 4 frames. If the script were
-restructured to loop over N scene variations (different cup arrangements, camera
-angles, lighting, etc.) within one Blender session, the overhead would be paid
-once and the marginal cost per frame would be ~0.25s.
+The ~13s/frame overhead is dominated by Blender's per-frame OptiX pipeline
+work (scene export, BVH rebuild, texture upload).  This cannot be reduced
+within a single process.  The effective options are:
 
-For example, 100 variations × 4 views = 400 frames:
-- **Current approach**: ~50s × 100 runs = ~83 minutes
-- **Single-session approach**: ~50s startup + 400 × ~0.25s = ~2 minutes
+1. **Parallel workers** — `generate_parallel.sh` runs N independent Blender
+   processes, each handling a non-overlapping range of scene indices.  Workers
+   share the GPU.  Default: 4 workers.  With 4 workers on a single RTX 4090,
+   throughput scales roughly linearly (4× → ~3.3s/image effective).
+
+2. **Lower resolution** — reducing from 1920×1080 would cut image write and
+   post-processing time, though the OptiX overhead dominates.
+
+3. **Simpler scenes** — fewer distractors and cups reduce BVH build time per
+   frame.
