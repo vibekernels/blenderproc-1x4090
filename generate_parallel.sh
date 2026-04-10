@@ -17,6 +17,7 @@ set -euo pipefail
 #   --workers      N   Number of parallel workers     (default: 4)
 #   --output-dir   DIR Output directory               (default: /workspace/beer_pong_dataset)
 #   --seed         N   Base random seed               (default: 42)
+#   --start-scene  N   Starting scene index           (default: 0)
 #   --assets-dir   DIR Path to downloaded assets      (default: ./assets)
 # ---------------------------------------------------------------------------
 
@@ -29,6 +30,7 @@ VIEWS_PER_SCENE=4
 WORKERS=4
 OUTPUT_DIR="/workspace/beer_pong_dataset"
 SEED=42
+START_SCENE=0
 ASSETS_DIR="$SCRIPT_DIR/assets"
 
 # --- Parse arguments ---
@@ -39,6 +41,7 @@ while [[ $# -gt 0 ]]; do
         --workers)         WORKERS="$2";         shift 2 ;;
         --output-dir)      OUTPUT_DIR="$2";      shift 2 ;;
         --seed)            SEED="$2";            shift 2 ;;
+        --start-scene)     START_SCENE="$2";     shift 2 ;;
         --assets-dir)      ASSETS_DIR="$2";      shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -72,6 +75,7 @@ echo " Total images:    $((NUM_SCENES * VIEWS_PER_SCENE))"
 echo " Workers:         $WORKERS"
 echo " Scenes/worker:   $SCENES_PER_WORKER (+$REMAINDER remainder)"
 echo " Output:          $OUTPUT_DIR"
+echo " Start scene:     $START_SCENE"
 echo " Seed:            $SEED"
 echo " Assets:          $ASSETS_DIR"
 echo "============================================================"
@@ -96,7 +100,7 @@ echo ""
 
 # --- Launch workers ---
 PIDS=()
-START=0
+START=$START_SCENE
 
 for ((w=0; w<WORKERS; w++)); do
     # Distribute remainder scenes across the first few workers
