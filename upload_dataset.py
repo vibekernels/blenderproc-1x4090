@@ -15,6 +15,6 @@ api.upload_folder(
     folder_path="/workspace/beer_pong_dataset",
     repo_id=repo_id,
     repo_type="dataset",
-    commit_message="Upload synthetic beer pong dataset (250 scenes x 4 views = 1000 images)",
+    commit_message="Upload synthetic beer pong dataset (1000 scenes x 4 views = 4000 images)",
 )
 print("Done!")
